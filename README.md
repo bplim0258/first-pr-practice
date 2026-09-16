@@ -1,6 +1,6 @@
 # First PR Practice
 
-A tiny calculator library, used to recieve pull requests for practice.
+A tiny calculator library, used to receive pull requests for practice.
 
 ## Usage
 
