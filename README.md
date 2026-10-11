@@ -42,3 +42,15 @@ python commute.py compare --direction 출근
 ```
 
 평균이 빠른 경로를 추천하고, 막히는 날(90퍼센타일) 기준으로 더 안정적인 경로가 다르면 함께 알려줍니다.
+
+### 3) 실시간 도착정보로 지금 뭘 탈지 추천
+
+공공데이터포털(data.go.kr)의 경기도 버스 API 키가 필요합니다.
+
+```bash
+export DATA_GO_KR_KEY="발급받은 일반 인증키(Decoding)"
+python commute.py station 신흥역          # 정류소ID 찾기
+python commute.py now --station <정류소ID> # 330·340번 도착시간 보고 버스/지하철 추천
+```
+
+정류장까지 걸어가는 시간(`--walk`, 기본 3분)보다 먼저 오는 버스는 제외하고, 기다리는 시간이 `--max-wait`(기본 10분)를 넘으면 지하철을 추천합니다.

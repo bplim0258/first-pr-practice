@@ -8,13 +8,21 @@
 
 import argparse
 import csv
+import json
+import os
 import statistics
 import sys
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
 DEFAULT_LOG = Path("commute_log.csv")
 LOG_FIELDS = ["date", "direction", "route", "minutes"]
+
+# 경기도 버스정보 API (공공데이터포털). 키는 환경변수 DATA_GO_KR_KEY 로 넣는다.
+GBIS_BASE = "https://apis.data.go.kr/6410000"
+API_KEY_ENV = "DATA_GO_KR_KEY"
 
 
 def parse_legs(spec):
@@ -133,6 +141,88 @@ def recommend(stats):
     return msg
 
 
+def _gbis_get(path, params):
+    key = os.environ.get(API_KEY_ENV)
+    if not key:
+        raise ValueError(f"환경변수 {API_KEY_ENV} 에 공공데이터포털 API 키를 넣어주세요.")
+    query = urllib.parse.urlencode({"serviceKey": key, "format": "json", **params})
+    with urllib.request.urlopen(f"{GBIS_BASE}/{path}?{query}", timeout=10) as resp:
+        return json.load(resp)
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def parse_stations(data):
+    """정류소 검색 응답 → [(정류소ID, 이름, 정류소번호), ...]"""
+    body = data.get("response", {}).get("msgBody") or {}
+    return [
+        (str(s.get("stationId")), s.get("stationName"), str(s.get("mobileNo", "")).strip())
+        for s in _as_list(body.get("busStationList"))
+    ]
+
+
+def parse_arrivals(data):
+    """도착정보 응답 → {노선이름: [첫번째 버스 분, 두번째 버스 분]} (정보 없는 버스는 제외)"""
+    body = data.get("response", {}).get("msgBody") or {}
+    arrivals = {}
+    for bus in _as_list(body.get("busArrivalList")):
+        name = str(bus.get("routeName") or bus.get("routeId"))
+        times = []
+        for key in ("predictTime1", "predictTime2"):
+            value = bus.get(key)
+            if value not in (None, ""):
+                times.append(int(value))
+        arrivals[name] = times
+    return arrivals
+
+
+def decide(arrivals, routes, walk, max_wait):
+    """정류장까지 걸어가서 탈 수 있는 버스 중 가장 빨리 오는 것을 고르고,
+    기다리는 시간이 max_wait 분 이하면 버스, 아니면 지하철을 추천한다."""
+    catchable = [
+        (minutes, route)
+        for route in routes
+        for minutes in arrivals.get(route, [])
+        if minutes >= walk
+    ]
+    if not catchable:
+        return "지하철", None, None
+    minutes, route = min(catchable)
+    wait = minutes - walk
+    return ("버스" if wait <= max_wait else "지하철"), route, minutes
+
+
+def cmd_station(args):
+    stations = parse_stations(
+        _gbis_get("busstationservice/v2/getBusStationListv2", {"keyword": args.keyword})
+    )
+    if not stations:
+        print("정류소를 찾지 못했습니다.")
+    for station_id, name, mobile_no in stations:
+        print(f"{station_id}  {name}  (정류소번호 {mobile_no})")
+
+
+def cmd_now(args):
+    arrivals = parse_arrivals(
+        _gbis_get("busarrivalservice/v2/getBusArrivalListv2", {"stationId": args.station})
+    )
+    for route in args.routes:
+        times = arrivals.get(route)
+        shown = ", ".join(f"{m}분" for m in times) if times else "도착정보 없음"
+        print(f"{route}번: {shown}")
+    choice, route, minutes = decide(arrivals, args.routes, args.walk, args.max_wait)
+    if route is None:
+        print("→ 지금 탈 수 있는 버스가 없습니다. 지하철을 타세요.")
+    elif choice == "버스":
+        print(f"→ {route}번 버스를 타세요. {minutes}분 후 도착 (지금 나가면 {minutes - args.walk}분 대기).")
+    else:
+        print(f"→ 가장 빠른 버스({route}번)도 {minutes}분 후라 지하철이 낫습니다.")
+
+
 def cmd_estimate(args):
     routes = {"버스": parse_legs(args.bus), "지하철": parse_legs(args.subway)}
     totals = {}
@@ -183,6 +273,17 @@ def build_parser():
     )
     p.set_defaults(func=cmd_estimate)
 
+    p = sub.add_parser("station", help="정류소 이름으로 정류소ID 찾기")
+    p.add_argument("keyword", help="예: 신흥역")
+    p.set_defaults(func=cmd_station)
+
+    p = sub.add_parser("now", help="실시간 도착정보로 지금 버스/지하철 중 뭘 탈지 추천")
+    p.add_argument("--station", required=True, help="정류소ID ('station' 명령으로 확인)")
+    p.add_argument("--routes", nargs="+", default=["330", "340"], help="직통 버스 노선")
+    p.add_argument("--walk", type=int, default=3, help="정류장까지 걸어가는 시간(분)")
+    p.add_argument("--max-wait", type=int, default=10, help="이보다 오래 기다려야 하면 지하철")
+    p.set_defaults(func=cmd_now)
+
     p = sub.add_parser("log", help="실제 소요시간 기록")
     p.add_argument("route", help="경로 이름 (예: 버스, 지하철)")
     p.add_argument("minutes", type=float, help="문 앞에서 문 앞까지 걸린 시간(분)")
@@ -202,7 +303,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
-    except ValueError as e:
+    except (ValueError, OSError) as e:
         print(f"오류: {e}", file=sys.stderr)
         return 1
     return 0
